@@ -8,7 +8,7 @@ Esto permite modificar valores como IP, puerto o buffer
 sin tener que editar varios archivos.
 
 Ejemplo:
-    from common.config import HOST, PORT, BUFFER_SIZE
+    from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE
 """
 
 # Dirección y puerto del servidor

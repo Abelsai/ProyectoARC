@@ -14,7 +14,7 @@ class ServerController:
         self.min_clients = min_clients
 
     async def start(self):
-        server = await asyncio.start_server(self.handle_client, SERVER_HOST, SERVER_PORT)
+        server = await asyncio.start_server(self.handle_client, SERVER_HOST, SERVER_PORT) # "Metodo" start_server crea corrutina, necesita await.
         print(f"[SERVIDOR] Escuchando en {SERVER_HOST}:{SERVER_PORT}")
         async with server:
             await server.serve_forever()
