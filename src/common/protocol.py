@@ -9,7 +9,7 @@ import json
 class MessageType(Enum):
     JOIN = "join"              # Cliente → Servidor (inicio de sesión)
     START = "start"            # Servidor → Clientes (inicio de simulación)
-    DATA = "data"              # Cliente → Servidor → Vecinos (coordenadas)
+    INFO = "info"              # Cliente → Servidor → Vecinos (coordenadas)
     ACK = "ack"                # Reconocimientos genéricos
     END = "end"                # Cliente/Servidor indican finalización
     ERROR = "error"            # Comunicación de errores
