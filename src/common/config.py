@@ -12,8 +12,8 @@ Ejemplo:
 """
 
 # Dirección y puerto del servidor
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 5000
+SERVER_HOST = "0.0.0.0"
+SERVER_PORT = 8888
 
 # Parámetros de red
 BUFFER_SIZE = 1024  
