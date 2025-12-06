@@ -1,7 +1,6 @@
 import asyncio
-import socket
-from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE  # Asegúrate de que estas variables estén definidas en common/config.py
-from common.protocol import make_message, MessageType, encode_message, decode_message  # Asegúrate de que estas funciones estén definidas en common/protocol.py
+import multiprocessing
+from client.controller.client_controller import ClientController
 
 
 def _ask_int(prompt: str, default: int | None = None) -> int:
@@ -18,39 +17,43 @@ def _ask_int(prompt: str, default: int | None = None) -> int:
 
 
 # Función para crear y conectar a un grupo de clientes
-async def connect_to_server(client_id, total_clients, start_id):
-    reader, writer = await asyncio.open_connection(SERVER_HOST, SERVER_PORT)
-    
-    transport = writer.transport
-    sock = transport.get_extra_info('socket')
-    
-    # Configura los buffers
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)
-
-    # Enviar mensaje JOIN
-    join_msg = make_message(MessageType.JOIN, "TEMP")
-    writer.write(encode_message(join_msg))
-    await writer.drain()
-    print(f"[CLIENTE {client_id + start_id}] Conectado al servidor")
-
-    await writer.drain()
-    writer.close()
-    await writer.wait_closed()
+async def connect_to_server(client_id, total_clients, start_id, iterations):
+    client_controller = ClientController(iterations=iterations)
+    await client_controller.connect()
 
 
-# Función principal para manejar todos los clientes
-async def main():
-    total_clients = _ask_int("Número total de clientes (N)", 65000)  # Número total de clientes
-    clients_per_process = total_clients  # Lanzamos todos los clientes en un solo proceso
+# Función para lanzar los clientes en diferentes procesos
+def launch_clients_process(start_id, total_clients, clients_per_process, iterations):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     tasks = []
+    # Dividir los clientes entre los procesos
     for client_id in range(clients_per_process):
-        tasks.append(connect_to_server(client_id, total_clients, 0))  # Lanza todos los clientes en un solo proceso
+        tasks.append(connect_to_server(client_id, total_clients, start_id, iterations))
 
-    # Ejecuta todas las tareas de manera concurrente
-    await asyncio.gather(*tasks)
+    loop.run_until_complete(asyncio.gather(*tasks))
+
+
+# Función para manejar el lanzamiento de múltiples procesos
+def main():
+    total_clients = _ask_int("Número total de clientes (N)", 65000)  # Número total de clientes
+    iterations = _ask_int("Número de iteraciones por cliente (S)", 100)  # Número de iteraciones por cliente
+    processes = _ask_int("Número de procesos (por ejemplo, 8)", 4)  # Número de procesos
+    clients_per_process = total_clients // processes  # Número de clientes por proceso
+
+    # Lanzar un proceso por cada grupo de clientes
+    processes_list = []
+    for i in range(processes):
+        start_id = i * clients_per_process
+        p = multiprocessing.Process(target=launch_clients_process, args=(start_id, total_clients, clients_per_process, iterations))
+        processes_list.append(p)
+        p.start()
+
+    # Esperar a que todos los procesos terminen
+    for p in processes_list:
+        p.join()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
