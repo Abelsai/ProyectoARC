@@ -13,6 +13,7 @@ Al final de S ciclos envía al servidor su tiempo medio de respuesta.
 import asyncio
 import random
 import time
+import socket
 
 from common.protocol import (
     make_message,
@@ -20,7 +21,7 @@ from common.protocol import (
     encode_message,
     decode_message,
 )
-from common.config import SERVER_HOST, SERVER_PORT
+from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE
 
 
 class ClientController:
@@ -46,6 +47,15 @@ class ClientController:
         self.reader, self.writer = await asyncio.open_connection(
             SERVER_HOST, SERVER_PORT
         )
+        
+        # Obtener el socket subyacente de la conexión asyncio
+        transport = self.writer.transport
+        sock = transport.get_extra_info('socket')
+        
+        # Establecer el tamaño del buffer (en bytes) para el envío y recepción de datos
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)  
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)  
+        
         assert (
             self.reader is not None and self.writer is not None
         ), "Error: conexión no establecida"

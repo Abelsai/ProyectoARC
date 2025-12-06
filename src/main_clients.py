@@ -1,16 +1,7 @@
-"""
-main_clients.py
-
-Lanza SOLO clientes CAR en ESTA máquina.
-
-- Pide S (número de iteraciones por cliente).
-- Pide cuántos clientes lanzar localmente (N_local).
-- Cada cliente se conecta al servidor definido en common.config.
-"""
-
 import asyncio
-
-from client.controller.client_controller import ClientController
+import socket
+from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE  # Asegúrate de que estas variables estén definidas en common/config.py
+from common.protocol import make_message, MessageType, encode_message, decode_message  # Asegúrate de que estas funciones estén definidas en common/protocol.py
 
 
 def _ask_int(prompt: str, default: int | None = None) -> int:
@@ -26,21 +17,40 @@ def _ask_int(prompt: str, default: int | None = None) -> int:
         return int(raw)
 
 
-async def run_clients():
-    print("=== CLIENTES CAR (solo clientes) ===")
+# Función para crear y conectar a un grupo de clientes
+async def connect_to_server(client_id, total_clients, start_id):
+    reader, writer = await asyncio.open_connection(SERVER_HOST, SERVER_PORT)
+    
+    transport = writer.transport
+    sock = transport.get_extra_info('socket')
+    
+    # Configura los buffers
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)
 
-    # Iteraciones por cliente
-    S = _ask_int("Número de iteraciones por cliente (S)", 100)
+    # Enviar mensaje JOIN
+    join_msg = make_message(MessageType.JOIN, "TEMP")
+    writer.write(encode_message(join_msg))
+    await writer.drain()
+    print(f"[CLIENTE {client_id + start_id}] Conectado al servidor")
 
-    # Número de clientes a lanzar en ESTA máquina
-    N_local = _ask_int("Número de clientes a lanzar en ESTA máquina", 500)
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
 
-    clients = [ClientController(iterations=S) for _ in range(N_local)]
-    tasks = [asyncio.create_task(c.connect()) for c in clients]
 
-    await asyncio.gather(*tasks, return_exceptions=True)
-    print("Todos los clientes de esta máquina han terminado.")
+# Función principal para manejar todos los clientes
+async def main():
+    total_clients = _ask_int("Número total de clientes (N)", 65000)  # Número total de clientes
+    clients_per_process = total_clients  # Lanzamos todos los clientes en un solo proceso
+
+    tasks = []
+    for client_id in range(clients_per_process):
+        tasks.append(connect_to_server(client_id, total_clients, 0))  # Lanza todos los clientes en un solo proceso
+
+    # Ejecuta todas las tareas de manera concurrente
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
-    asyncio.run(run_clients())
+    asyncio.run(main())

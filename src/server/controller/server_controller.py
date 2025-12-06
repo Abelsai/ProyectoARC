@@ -11,9 +11,10 @@ from common.protocol import (
     encode_message,
     decode_message,
 )
-from common.config import SERVER_HOST, SERVER_PORT
+from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE
 from common.logger import logger
 from common.utils import generate_client_id
+import socket 
 
 
 class ServerController:
@@ -50,6 +51,13 @@ class ServerController:
             writer.close()
             await writer.wait_closed()
             return
+        
+        transport = writer.transport
+        sock = transport.get_extra_info('socket')
+        
+        # Establecer el tamaño del buffer para el socket del cliente
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)  
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)  
 
         _ = decode_message(data)       # ignoramos el ID temp
         cid = generate_client_id()     # ID verdadero generado por servidor
@@ -96,16 +104,19 @@ class ServerController:
     async def start_simulation(self):
         logger.info("[SERVIDOR] Enviando START a todos los clientes")
 
+        tasks = []
         for cid, w in self.clients.items():
             msg = make_message(
                 MessageType.START,
                 "server",
                 {"id": cid, "neighbours": self.neighbours[cid]},
             )
-            w.write(encode_message(msg))
-            await w.drain()
+            tasks.append(w.write(encode_message(msg)))
 
+        # Esperar a que todos los mensajes se hayan enviado
+        await asyncio.gather(*tasks)
         logger.info("[SERVIDOR] Simulación iniciada")
+
 
     # -------------------------------------------------------------------------
     async def process_message(self, msg: dict):
@@ -115,19 +126,21 @@ class ServerController:
 
         # ------------ INFO -----------------
         if mtype == MessageType.INFO.value:
-            # No log por cada INFO para no matar el rendimiento
+        # Reenviar a vecinos directamente
+            forward = {
+                "type": MessageType.INFO.value,
+                "client_id": cid,
+                "data": msg["data"],
+            }
 
-            # Reenviar a vecinos
+            tasks = []
             for n in self.neighbours.get(cid, []):
                 if n in self.clients:
                     w = self.clients[n]
-                    forward = {
-                        "type": MessageType.INFO.value,
-                        "client_id": cid,
-                        "data": msg["data"],
-                    }
-                    w.write(encode_message(forward))
-                    await w.drain()
+                    tasks.append(w.write(encode_message(forward)))
+            
+          
+            await asyncio.gather(*tasks)
 
         # ------------ ACK ------------------
         elif mtype == MessageType.ACK.value:

@@ -22,9 +22,4 @@ ENCODING = "utf-8"
 # Configuración de simulación
 SIMULATION_INTERVAL = 2.0   
 
-# Número de iteraciones por cliente (simulación)
-NUM_ITERATIONS = 150
-
 MAX_PER_BARRIO = 10
-
-NUM_CLIENTES = 300
