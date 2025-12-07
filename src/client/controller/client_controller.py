@@ -1,66 +1,47 @@
-"""
-Cliente del sistema CAR optimizado sin polling (usa asyncio.Event).
-
-En cada ciclo:
-- genera coordenadas (x, y, z),
-- las envía al servidor (INFO),
-- espera los ACK de todos sus vecinos sin bucles de polling,
-- mide el tiempo de respuesta del ciclo.
-
-Al final de S ciclos envía al servidor su tiempo medio de respuesta.
-"""
-
+# client/controller/client_controller.py
 import asyncio
 import random
 import time
 import socket
+import winloop  # alternativa a uvloop en Windows
 
-from common.protocol import (
-    make_message,
-    MessageType,
-    encode_message,
-    decode_message,
-)
+from common.protocol import make_message, MessageType, encode_message, decode_message
 from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE
 
-
 class ClientController:
+    """
+    Cliente optimizado para Windows: instala winloop, desactiva Nagle y espera ACKs sin polling.
+    """
     def __init__(self, iterations: int):
-        self.id: str | None = None   # <- lo asigna el servidor en START
+        self.id: str | None = None
         self.iterations = iterations
 
-        self.reader = None
-        self.writer = None
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
 
         self.neighbours: list[str] = []
         self.pending_acks: set[str] = set()
-
-        # Evento para esperar a que lleguen todos los ACKs
         self.acks_done = asyncio.Event()
-
-        # Métricas: lista de tiempos de respuesta por ciclo
         self.latencies: list[float] = []
 
-    # ---------------- CONEXIÓN ----------------
     async def connect(self):
-        """Establece conexión con el servidor y espera START."""
-        self.reader, self.writer = await asyncio.open_connection(
-            SERVER_HOST, SERVER_PORT
-        )
-        
-        # Obtener el socket subyacente de la conexión asyncio
-        transport = self.writer.transport
-        sock = transport.get_extra_info('socket')
-        
-        # Establecer el tamaño del buffer (en bytes) para el envío y recepción de datos
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)  
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)  
-        
-        assert (
-            self.reader is not None and self.writer is not None
-        ), "Error: conexión no establecida"
+        """
+        Conecta con el servidor y espera el mensaje START. Instala winloop para acelerar el bucle.
+        """
+        winloop.install()
+        self.reader, self.writer = await asyncio.open_connection(SERVER_HOST, SERVER_PORT)
 
-        # JOIN con ID temporal (el servidor lo ignora y genera uno nuevo)
+        # Ajustar el socket del cliente
+        transport = self.writer.transport
+        sock: socket.socket = transport.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)
+
+        assert self.reader is not None and self.writer is not None, "Error de conexión"
+
+        # Enviar JOIN
         join_msg = make_message(MessageType.JOIN, "TEMP")
         self.writer.write(encode_message(join_msg))
         await self.writer.drain()
@@ -68,9 +49,10 @@ class ClientController:
 
         await self.listen_server()
 
-    # ---------------- ESCUCHA ----------------
     async def listen_server(self):
-        """Escucha y procesa mensajes del servidor."""
+        """
+        Escucha los mensajes del servidor y actúa según su tipo.
+        """
         assert self.reader is not None
 
         while data := await self.reader.readline():
@@ -78,7 +60,6 @@ class ClientController:
             msg_type = msg.get("type")
 
             if msg_type == MessageType.START.value:
-                # Recibir ID asignado y vecinos y arrancar simulación
                 data_start = msg["data"]
                 self.id = data_start.get("id")
                 self.neighbours = data_start.get("neighbours", [])
@@ -101,70 +82,51 @@ class ClientController:
         self.writer.close()
         await self.writer.wait_closed()
 
-    # ---------------- PROCESAMIENTO DE MENSAJES ----------------
     async def _handle_info(self, sender: str | None):
         """
-        Procesa INFO recibido de un vecino (vía servidor).
-        En el modelo CAR, el vecino sólo debe enviar un ACK.
+        Envía un ACK al recibir coordenadas de un vecino.
         """
         if sender is None:
             return
         assert self.writer is not None and self.id is not None
 
-        ack_msg = make_message(
-            MessageType.ACK, self.id, {"ack_to": sender}
-        )
+        ack_msg = make_message(MessageType.ACK, self.id, {"ack_to": sender})
         self.writer.write(encode_message(ack_msg))
         await self.writer.drain()
 
     async def _handle_ack(self, sender: str | None):
-        """Confirma recepción de ACKs esperados."""
+        """
+        Marca la llegada de un ACK. Cuando todos han llegado se activa el evento.
+        """
         if sender is None:
             return
 
         if sender in self.pending_acks:
             self.pending_acks.remove(sender)
-
-            # Si ya no quedan ACKs pendientes → liberar el evento
             if not self.pending_acks:
                 self.acks_done.set()
 
-    # ---------------- SIMULACIÓN ----------------
     async def run_simulation(self):
         """
-        Ciclo principal de simulación CAR.
-        Cada iteración:
-           - genera (x, y, z),
-           - envía INFO,
-           - espera ACKs de todos los vecinos sin polling,
-           - mide el tiempo de respuesta.
+        Bucle principal de simulación: envía coordenadas y espera ACKs sin polling.
         """
         assert self.writer is not None and self.id is not None
 
         for _ in range(self.iterations):
             await self._send_coords_and_wait_acks()
-
-            # Pausa ligera para no monopolizar la CPU
             await asyncio.sleep(random.uniform(0.01, 0.05))
 
-        # Envío de métricas finales (tiempo medio de respuesta)
+        # Enviar la latencia media
         avg_resp = sum(self.latencies) / len(self.latencies) if self.latencies else 0.0
-
-        msg = make_message(
-            MessageType.END,
-            self.id,
-            {"avg_response_time": avg_resp},
-        )
+        msg = make_message(MessageType.END, self.id, {"avg_response_time": avg_resp})
         self.writer.write(encode_message(msg))
         await self.writer.drain()
-        print(
-            f"[{self.id}] Métricas enviadas "
-            f"(tiempo medio de respuesta: {avg_resp * 1000:.2f} ms)"
-        )
+        print(f"[{self.id}] Métricas enviadas (tiempo medio: {avg_resp * 1000:.2f} ms)")
 
-    # ---------------- ENVÍO Y ESPERA SIN POLLING ----------------
     async def _send_coords_and_wait_acks(self):
-        """Envía INFO con coordenadas y espera ACKs usando asyncio.Event (sin polling)."""
+        """
+        Envía un mensaje INFO con coordenadas y espera la recepción de todos los ACKs.
+        """
         assert self.writer is not None and self.id is not None
 
         coords = {
@@ -173,28 +135,19 @@ class ClientController:
             "z": random.uniform(0.0, 100.0),
         }
 
-        # Preparar espera de ACKs
         self.pending_acks = set(self.neighbours)
         self.acks_done.clear()
 
         start_time = time.perf_counter()
 
-        # Enviar INFO
-        info_msg = make_message(
-            MessageType.INFO,
-            self.id,
-            coords,
-        )
+        info_msg = make_message(MessageType.INFO, self.id, coords)
         self.writer.write(encode_message(info_msg))
         await self.writer.drain()
 
-        # Esperar a que lleguen todos los ACKs sin polling
         try:
             await asyncio.wait_for(self.acks_done.wait(), timeout=10.0)
         except asyncio.TimeoutError:
-            print(
-                f"[{self.id}] Timeout: {len(self.pending_acks)} ACK(s) pendientes"
-            )
+            print(f"[{self.id}] Timeout: {len(self.pending_acks)} ACK(s) pendientes")
 
         latency = time.perf_counter() - start_time
         self.latencies.append(latency)
