@@ -1,11 +1,13 @@
-# Dirección y puerto del servidor
+# common/config.py
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 8888
 
-# Parámetros de red
-BUFFER_SIZE = 16384   # antes 4096
+# Tamaño de los buffers de red
+BUFFER_SIZE = 4096  # aumentar el buffer puede ayudar a throughput
+
 ENCODING = "utf-8"
 
-# Simulación
+# Configuración de simulación
 SIMULATION_INTERVAL = 2.0
+
 MAX_PER_BARRIO = 10

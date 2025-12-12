@@ -1,17 +1,16 @@
+# client/controller/client_controller.py
 import asyncio
 import random
 import time
 import socket
-import contextlib
 import winloop  # alternativa a uvloop en Windows
 
 from common.protocol import make_message, MessageType, encode_message, decode_message
 from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE
 
-
 class ClientController:
     """
-    Cliente Windows: usa winloop, TCP_NODELAY y espera TODOS los ACKs (sin polling activo).
+    Cliente optimizado para Windows: instala winloop, desactiva Nagle y espera ACKs sin polling.
     """
     def __init__(self, iterations: int):
         self.id: str | None = None
@@ -26,11 +25,13 @@ class ClientController:
         self.latencies: list[float] = []
 
     async def connect(self):
-        """Conecta y espera START."""
+        """
+        Conecta con el servidor y espera el mensaje START. Instala winloop para acelerar el bucle.
+        """
         winloop.install()
         self.reader, self.writer = await asyncio.open_connection(SERVER_HOST, SERVER_PORT)
 
-        # Ajustar el socket
+        # Ajustar el socket del cliente
         transport = self.writer.transport
         sock: socket.socket = transport.get_extra_info("socket")
         if sock is not None:
@@ -38,13 +39,9 @@ class ClientController:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)
 
-        # Intentar limitar el buffer de escritura del transporte (si está disponible)
-        with contextlib.suppress(Exception):
-            self.writer.transport.set_write_buffer_limits(high=256 * 1024, low=64 * 1024)
-
         assert self.reader is not None and self.writer is not None, "Error de conexión"
 
-        # JOIN
+        # Enviar JOIN
         join_msg = make_message(MessageType.JOIN, "TEMP")
         self.writer.write(encode_message(join_msg))
         await self.writer.drain()
@@ -53,7 +50,9 @@ class ClientController:
         await self.listen_server()
 
     async def listen_server(self):
-        """Escucha mensajes del servidor."""
+        """
+        Escucha los mensajes del servidor y actúa según su tipo.
+        """
         assert self.reader is not None
 
         while data := await self.reader.readline():
@@ -84,7 +83,9 @@ class ClientController:
         await self.writer.wait_closed()
 
     async def _handle_info(self, sender: str | None):
-        """Responde con ACK al recibir coordenadas de un vecino."""
+        """
+        Envía un ACK al recibir coordenadas de un vecino.
+        """
         if sender is None:
             return
         assert self.writer is not None and self.id is not None
@@ -94,7 +95,9 @@ class ClientController:
         await self.writer.drain()
 
     async def _handle_ack(self, sender: str | None):
-        """Marca la llegada de ACKs. Cuando están todos, dispara el evento."""
+        """
+        Marca la llegada de un ACK. Cuando todos han llegado se activa el evento.
+        """
         if sender is None:
             return
 
@@ -104,15 +107,16 @@ class ClientController:
                 self.acks_done.set()
 
     async def run_simulation(self):
-        """Ciclo de simulación: envía coords y espera TODOS los ACKs."""
+        """
+        Bucle principal de simulación: envía coordenadas y espera ACKs sin polling.
+        """
         assert self.writer is not None and self.id is not None
 
         for _ in range(self.iterations):
             await self._send_coords_and_wait_acks()
-            # si haces >1 iteración, puedes descomentar el jitter:
-            # await asyncio.sleep(random.uniform(0.01, 0.05))
+            await asyncio.sleep(random.uniform(0.01, 0.05))
 
-        # Métrica final
+        # Enviar la latencia media
         avg_resp = sum(self.latencies) / len(self.latencies) if self.latencies else 0.0
         msg = make_message(MessageType.END, self.id, {"avg_response_time": avg_resp})
         self.writer.write(encode_message(msg))
@@ -120,7 +124,9 @@ class ClientController:
         print(f"[{self.id}] Métricas enviadas (tiempo medio: {avg_resp * 1000:.2f} ms)")
 
     async def _send_coords_and_wait_acks(self):
-        """Envía INFO y espera TODOS los ACKs (timeout defensivo)."""
+        """
+        Envía un mensaje INFO con coordenadas y espera la recepción de todos los ACKs.
+        """
         assert self.writer is not None and self.id is not None
 
         coords = {
@@ -128,6 +134,8 @@ class ClientController:
             "y": random.uniform(0.0, 100.0),
             "z": random.uniform(0.0, 100.0),
         }
+        
+        await asyncio.sleep(random.uniform(0.01, 0.05))  
 
         self.pending_acks = set(self.neighbours)
         self.acks_done.clear()
