@@ -1,9 +1,11 @@
 # common/config.py
-SERVER_HOST = "0.0.0.0"
+SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8888
 
+SERVER_PORTS = [8888, 8889, 8890, 8891, 8892, 8893, 8894, 8895, 8896, 8897]
+
 # Tamaño de los buffers de red
-BUFFER_SIZE = 4096  # aumentar el buffer puede ayudar a throughput
+BUFFER_SIZE = 65536 # aumentar el buffer puede ayudar a throughput
 
 ENCODING = "utf-8"
 
