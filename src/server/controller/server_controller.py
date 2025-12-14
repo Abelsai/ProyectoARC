@@ -4,13 +4,12 @@ import socket
 import contextlib
 import time
 
-import winloop
 from common.protocol import make_message, MessageType, encode_message, decode_message
-from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE
+from common.config import SERVER_HOST, SERVER_PORT
 from common.logger import logger
 from common.utils import generate_client_id
 
-# psutil es opcional; si no está instalado, se desactivan métricas de CPU
+# psutil es opcional
 try:
     import psutil
     _PSUTIL_OK = True
@@ -18,128 +17,78 @@ except Exception:
     _PSUTIL_OK = False
 
 
-class _Conn:
-    """Actor de escritura por conexión: aísla writers lentos y minimiza drains."""
-    __slots__ = ("cid", "writer", "q", "_task", "_pending_bytes")
-
-    def __init__(self, cid: str, writer: asyncio.StreamWriter):
-        self.cid = cid
-        self.writer = writer
-        self.q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1000)
-        self._pending_bytes = 0
-        try:
-            self.writer.transport.set_write_buffer_limits(high=256 * 1024, low=64 * 1024)
-        except Exception:
-            pass
-        self._task = asyncio.create_task(self._writer_loop(), name=f"writer[{cid}]")
-
-    async def _writer_loop(self):
-        try:
-            while True:
-                data = await self.q.get()
-                self.writer.write(data)
-                self._pending_bytes += len(data)
-                if self.q.empty() or self._pending_bytes >= 128 * 1024:
-                    await self.writer.drain()
-                    self._pending_bytes = 0
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug(f"[writer {self.cid}] terminado por error: {e}")
-        finally:
-            with contextlib.suppress(Exception):
-                self.writer.close()
-                # En Windows evitamos esperar a wait_closed()
-
-    def send_bytes(self, payload: bytes):
-        try:
-            self.q.put_nowait(payload)
-        except asyncio.QueueFull:
-            logger.debug(f"[writer {self.cid}] cola llena, drop 1 mensaje")
-
-    def send_msg(self, msg: dict):
-        self.send_bytes(encode_message(msg))
-
-    async def close(self):
-        self._task.cancel()
-        with contextlib.suppress(Exception):
-            await self._task
-
-
 class ServerController:
     """
-    Servidor optimizado:
-      - winloop (Windows)
-      - escritor por conexión (sin head-of-line blocking)
-      - START único y simultáneo para todos (cuando estén todos conectados)
-      - logs ligeros
-      - monitor de carga: pico de tráfico y CPU en ese instante
+    Servidor optimizado (sin writer-task por conexión):
+      - START único a todos cuando estén todos conectados
+      - Envío directo por StreamWriter (sin colas por conexión)
+      - Backpressure ligero: si el buffer crece, se programa drain() con timeout
+      - Monitor de carga
     """
     MONITOR_INTERVAL = 1.0  # s
 
-    def __init__(self, total_clients: int, group_size: int, host: str = SERVER_HOST, port: int = SERVER_PORT):
+    # si el buffer del transport supera esto, drenamos (en una tarea corta)
+    _DRAIN_HIGH_WATER = 512 * 1024
+    _DRAIN_TIMEOUT = 5.0
+
+    def __init__(self, total_clients: int, group_size: int, host: str = SERVER_HOST, port: int = 8888):
         self.total_clients = total_clients
         self.group_size = group_size
         self.host = host
         self.port = port
 
-        self.clients: dict[str, _Conn] = {}          # id -> _Conn
-        self.neighbours: dict[str, list[str]] = {}   # id -> vecinos
-        self.groups: list[list[str]] = []            # lista de grupos (ids)
-        self.client_group: dict[str, int] = {}       # id -> índice grupo
+        # id -> StreamWriter
+        self.clients: dict[str, asyncio.StreamWriter] = {}
+
+        self.neighbours: dict[str, list[str]] = {}
+        self.groups: list[list[str]] = []
+        self.client_group: dict[str, int] = {}
 
         self.client_metrics: dict[str, float] = {}
 
-        # Acumuladores de ACKs (globales)
         self.acks_expected_sum = 0
         self.acks_received_sum = 0
 
-        # Monitor de tráfico y CPU
-        self._msg_counter = 0                      
+        # Monitor
+        self._msg_counter = 0
         self._peak_msgs_per_sec = 0.0
-        self._peak_cpu_total = None               
-        self._peak_cpu_process = None             
-        self._peak_ts = None                      
+        self._peak_cpu_total = None
+        self._peak_cpu_process = None
+        self._peak_ts = None
         self._monitor_task: asyncio.Task | None = None
 
-       
-        self._start_sent = False                 
-        self._start_lock = asyncio.Lock()         
-        self._finalized = False                   
+        # START/finalize
+        self._start_sent = False
+        self._start_lock = asyncio.Lock()
+        self._finalized = False
+
+        # drain tasks por cliente (solo cuando hace falta)
+        self._drain_tasks: dict[str, asyncio.Task] = {}
 
         logger.info(f"[SERVIDOR] Iniciado (N={total_clients}, V={group_size}, host={self.host}, port={self.port})")
 
     async def start(self):
-        winloop.install()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         logger.info(f"[SERVIDOR] Bucle de eventos: {type(loop)}")
 
-        # Arrancamos el monitor de tráfico/CPU
         self._monitor_task = asyncio.create_task(self._monitor_load(), name="monitor_load")
 
         server = await asyncio.start_server(
             self.handle_client,
             self.host,
             self.port,
-            backlog=max(self.total_clients * 2, 4096),
+            backlog=socket.SOMAXCONN,  # el SO lo ajusta; mejor que números enormes
         )
         logger.info(f"[SERVIDOR] Escuchando en {self.host}:{self.port}")
         async with server:
             await server.serve_forever()
 
     async def _monitor_load(self):
-        """
-        Cada MONITOR_INTERVAL segundos:
-        - calcula msgs/s (delta de _msg_counter)
-        - muestrea CPU (sistema y proceso, si psutil está disponible)
-        - si es el mayor tráfico hasta ahora, guarda el % de CPU y el pico
-        """
         prev_count = 0
-        # Inicializaciones de psutil para que las lecturas tengan sentido
         if _PSUTIL_OK:
             _ = psutil.cpu_percent(interval=None)
-            _proc = psutil.Process()
-            _ = _proc.cpu_percent(interval=None)
+            _p = psutil.Process()
+            _ = _p.cpu_percent(interval=None)
 
         while True:
             await asyncio.sleep(self.MONITOR_INTERVAL)
@@ -154,7 +103,7 @@ class ServerController:
             if _PSUTIL_OK:
                 try:
                     cpu_total = psutil.cpu_percent(interval=None)
-                    cpu_proc = psutil.Process().cpu_percent(interval=None)  # % del proceso (sobre 100*n núcleos)
+                    cpu_proc = psutil.Process().cpu_percent(interval=None)
                 except Exception:
                     pass
 
@@ -166,8 +115,52 @@ class ServerController:
                 if cpu_proc is not None:
                     self._peak_cpu_process = cpu_proc
 
+    def _configure_socket(self, writer: asyncio.StreamWriter):
+        transport = writer.transport
+        sock: socket.socket = transport.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
+        try:
+            transport.set_write_buffer_limits(high=256 * 1024, low=64 * 1024)
+        except Exception:
+            pass
+
+    def _send_bytes(self, cid: str, b: bytes):
+        """Envío rápido + backpressure: si el buffer crece, programamos un drain corto."""
+        w = self.clients.get(cid)
+        if not w:
+            return
+        try:
+            w.write(b)
+        except Exception:
+            return
+
+        # backpressure: si el buffer está alto, drenamos (sin bloquear hot-path)
+        try:
+            tr = w.transport
+            if tr.get_write_buffer_size() >= self._DRAIN_HIGH_WATER:
+                if cid not in self._drain_tasks or self._drain_tasks[cid].done():
+                    self._drain_tasks[cid] = asyncio.create_task(self._drain_writer(cid, w))
+        except Exception:
+            pass
+
+    async def _drain_writer(self, cid: str, w: asyncio.StreamWriter):
+        try:
+            await asyncio.wait_for(w.drain(), timeout=self._DRAIN_TIMEOUT)
+        except Exception:
+            # si falla, probablemente el socket murió o está muy saturado
+            pass
+        finally:
+            # limpia si sigue siendo la misma conexión
+            t = self._drain_tasks.get(cid)
+            if t and t is asyncio.current_task():
+                self._drain_tasks.pop(cid, None)
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        conn: _Conn | None = None
         cid: str | None = None
         try:
             data = await reader.readline()
@@ -175,25 +168,14 @@ class ServerController:
                 writer.close()
                 return
 
-            transport = writer.transport
-            sock: socket.socket = transport.get_extra_info("socket")
-            if sock is not None:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                #sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
-                #sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)
-            try:
-                transport.set_write_buffer_limits(high=256 * 1024, low=64 * 1024)
-            except Exception:
-                pass
+            self._configure_socket(writer)
 
-            _ = decode_message(data)
+            _ = decode_message(data)  # JOIN (no lo necesitamos para id)
             cid = generate_client_id()
 
-            conn = _Conn(cid, writer)
-            self.clients[cid] = conn
+            self.clients[cid] = writer
             self._assign_to_group(cid)
 
-            # Intento de disparar START (atómico y solo una vez)
             asyncio.create_task(self._maybe_send_start())
 
             while True:
@@ -211,16 +193,16 @@ class ServerController:
             logger.error(f"[ERROR] Cliente error inesperado: {e}")
         finally:
             if cid:
-                with contextlib.suppress(KeyError):
-                    del self.clients[cid]
-            if conn:
-                with contextlib.suppress(Exception):
-                    await conn.close()
+                self.clients.pop(cid, None)
+                # cancela drain si existía
+                t = self._drain_tasks.pop(cid, None)
+                if t:
+                    t.cancel()
+
             with contextlib.suppress(Exception):
                 writer.close()
 
     def _assign_to_group(self, cid: str):
-        # Tras enviar START no seguimos formando grupos (evita ruido si llegara alguien tarde)
         if self._start_sent:
             return
 
@@ -237,10 +219,6 @@ class ServerController:
             self.neighbours[c] = [n for n in group if n != c]
 
     async def _maybe_send_start(self):
-        """
-        Dispara el START exactamente una vez, cuando len(clients) == total_clients.
-        Protegido con lock + fusible (double-checked locking).
-        """
         if self._start_sent or len(self.clients) < self.total_clients:
             return
         async with self._start_lock:
@@ -250,25 +228,21 @@ class ServerController:
             await self._send_start()
 
     async def _send_start(self):
-        """Envía el mensaje START a todos los clientes una vez estén todos conectados (un solo burst)."""
         for gidx in range(len(self.groups)):
             group = self.groups[gidx]
             for cid in group:
-                conn = self.clients.get(cid)
-                if not conn:
-                    continue
                 start_msg = make_message(
                     MessageType.START, "server",
                     {"id": cid, "neighbours": self.neighbours.get(cid, [])}
                 )
-                conn.send_msg(start_msg)
+                self._send_bytes(cid, encode_message(start_msg))
+
         logger.info(f"[SERVIDOR] START enviado a {sum(len(g) for g in self.groups)} clientes en {self.port}")
 
     def _process_message_fast(self, msg: dict):
         cid = msg["client_id"]
         mtype = msg["type"]
 
-        # Contabilizamos tráfico en hot-path
         if mtype in (MessageType.INFO.value, MessageType.ACK.value, MessageType.END.value):
             self._msg_counter += 1
 
@@ -280,33 +254,29 @@ class ServerController:
             }
             b = encode_message(payload)
             for n in self.neighbours.get(cid, []):
-                conn = self.clients.get(n)
-                if conn:
-                    conn.send_bytes(b)
+                self._send_bytes(n, b)
 
         elif mtype == MessageType.ACK.value:
             dest = msg["data"].get("ack_to")
-            conn = self.clients.get(dest)
-            if conn:
+            if dest:
                 ack_msg = {
                     "type": MessageType.ACK.value,
                     "client_id": cid,
                     "data": {"from": cid},
                 }
-                conn.send_bytes(encode_message(ack_msg))
+                self._send_bytes(dest, encode_message(ack_msg))
 
         elif mtype == MessageType.END.value:
             if self._finalized:
                 return
+
             data = msg.get("data", {})
-            # Evita contar métricas duplicadas del mismo cliente
             if cid in self.client_metrics:
                 return
 
             avg_resp = float(data.get("avg_response_time", 0.0))
             self.client_metrics[cid] = avg_resp
 
-            # Acumular métricas de ACK enviadas por el cliente
             ae = int(data.get("acks_expected", 0))
             ar = int(data.get("acks_received", 0))
             self.acks_expected_sum += ae
@@ -334,7 +304,6 @@ class ServerController:
         logger.info("-----------------------------")
         logger.info(f"Media global del sistema: {global_avg*1000:.2f} ms")
 
-        # Resumen ACKs + pérdida %
         if self.acks_expected_sum > 0:
             loss_pct_total = 100.0 * (max(0, self.acks_expected_sum - self.acks_received_sum) / self.acks_expected_sum)
         else:
@@ -346,7 +315,6 @@ class ServerController:
             self.acks_received_sum, self.acks_expected_sum, loss_pct_total
         )
 
-        # Pico de tráfico y CPU en ese instante
         if self._peak_msgs_per_sec > 0:
             if _PSUTIL_OK and (self._peak_cpu_total is not None or self._peak_cpu_process is not None):
                 logger.info(
@@ -356,17 +324,15 @@ class ServerController:
                     (self._peak_cpu_process if self._peak_cpu_process is not None else -1.0),
                 )
             else:
-                logger.info("Pico de tráfico: ~%.0f msgs/s | Métricas de CPU no disponibles (instala psutil).",
-                            self._peak_msgs_per_sec)
+                logger.info("Pico de tráfico: ~%.0f msgs/s | CPU no disponible (instala psutil).", self._peak_msgs_per_sec)
         else:
             logger.info("No se detectó tráfico para calcular picos.")
 
-        # END broadcast sin bloquear el loop
+        # END broadcast
         end_bytes = encode_message(make_message(MessageType.END, "server", {"msg": "Fin"}))
-        for conn in list(self.clients.values()):
-            conn.send_bytes(end_bytes)
+        for cid in list(self.clients.keys()):
+            self._send_bytes(cid, end_bytes)
 
-        # Paramos el monitor
         if self._monitor_task:
             self._monitor_task.cancel()
             with contextlib.suppress(Exception):
