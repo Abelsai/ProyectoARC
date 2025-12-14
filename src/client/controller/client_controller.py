@@ -8,9 +8,11 @@ import winloop  # alternativa a uvloop en Windows
 from common.protocol import make_message, MessageType, encode_message, decode_message
 from common.config import SERVER_HOST, SERVER_PORT, BUFFER_SIZE
 
+
 class ClientController:
     """
     Cliente optimizado para Windows: instala winloop, desactiva Nagle y espera ACKs sin polling.
+    Además, reporta métricas de ACK (esperados vs recibidos).
     """
     def __init__(self, iterations: int):
         self.id: str | None = None
@@ -23,6 +25,10 @@ class ClientController:
         self.pending_acks: set[str] = set()
         self.acks_done = asyncio.Event()
         self.latencies: list[float] = []
+
+        # Métricas de ACK (mínimo viable)
+        self.acks_expected_total = 0
+        self.acks_received_total = 0
 
     async def connect(self):
         """
@@ -103,6 +109,7 @@ class ClientController:
 
         if sender in self.pending_acks:
             self.pending_acks.remove(sender)
+            self.acks_received_total += 1
             if not self.pending_acks:
                 self.acks_done.set()
 
@@ -116,12 +123,30 @@ class ClientController:
             await self._send_coords_and_wait_acks()
             await asyncio.sleep(random.uniform(0.01, 0.05))
 
-        # Enviar la latencia media
+        # Enviar métricas al servidor (incluye ACKs)
         avg_resp = sum(self.latencies) / len(self.latencies) if self.latencies else 0.0
-        msg = make_message(MessageType.END, self.id, {"avg_response_time": avg_resp})
+        ack_loss_pct = (
+            100.0 * (max(0, self.acks_expected_total - self.acks_received_total) / self.acks_expected_total)
+            if self.acks_expected_total > 0 else 0.0
+        )
+
+        msg = make_message(
+            MessageType.END,
+            self.id,
+            {
+                "avg_response_time": avg_resp,                 # segundos
+                "acks_expected": self.acks_expected_total,     # contadores
+                "acks_received": self.acks_received_total,
+            }
+        )
         self.writer.write(encode_message(msg))
         await self.writer.drain()
-        print(f"[{self.id}] Métricas enviadas (tiempo medio: {avg_resp * 1000:.2f} ms)")
+
+        print(
+            f"[{self.id}] Métricas: avg={avg_resp*1000:.2f} ms | "
+            f"ACKs {self.acks_received_total}/{self.acks_expected_total} "
+            f"({ack_loss_pct:.2f}% pérdida)"
+        )
 
     async def _send_coords_and_wait_acks(self):
         """
@@ -134,8 +159,9 @@ class ClientController:
             "y": random.uniform(0.0, 100.0),
             "z": random.uniform(0.0, 100.0),
         }
-        
-        await asyncio.sleep(random.uniform(0.01, 0.05))  
+
+        # Contabilizamos ACKs esperados en esta iteración
+        self.acks_expected_total += len(self.neighbours)
 
         self.pending_acks = set(self.neighbours)
         self.acks_done.clear()
@@ -147,7 +173,7 @@ class ClientController:
         await self.writer.drain()
 
         try:
-            await asyncio.wait_for(self.acks_done.wait(), timeout=10.0)
+            await asyncio.wait_for(self.acks_done.wait(), timeout=30.0)
         except asyncio.TimeoutError:
             print(f"[{self.id}] Timeout: {len(self.pending_acks)} ACK(s) pendientes")
 
