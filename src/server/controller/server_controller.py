@@ -95,17 +95,17 @@ class ServerController:
         self.acks_received_sum = 0
 
         # Monitor de tráfico y CPU
-        self._msg_counter = 0                      # mensajes procesados (INFO/ACK/END)
+        self._msg_counter = 0                      
         self._peak_msgs_per_sec = 0.0
-        self._peak_cpu_total = None               # %
-        self._peak_cpu_process = None             # %
-        self._peak_ts = None                      # timestamp perf_counter del pico
+        self._peak_cpu_total = None               
+        self._peak_cpu_process = None             
+        self._peak_ts = None                      
         self._monitor_task: asyncio.Task | None = None
 
-        # Fusibles/locks de control
-        self._start_sent = False                  # garantiza START único
-        self._start_lock = asyncio.Lock()         # exclusión para disparo de START
-        self._finalized = False                   # evita finalizar 2 veces / contar END duplicados
+       
+        self._start_sent = False                 
+        self._start_lock = asyncio.Lock()         
+        self._finalized = False                   
 
         logger.info(f"[SERVIDOR] Iniciado (N={total_clients}, V={group_size}, host={self.host}, port={self.port})")
 
@@ -179,8 +179,8 @@ class ServerController:
             sock: socket.socket = transport.get_extra_info("socket")
             if sock is not None:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)
+                #sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
+                #sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)
             try:
                 transport.set_write_buffer_limits(high=256 * 1024, low=64 * 1024)
             except Exception:
